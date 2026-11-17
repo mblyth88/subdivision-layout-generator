@@ -1363,7 +1363,17 @@ function setCouncil(code,minFrontage,minLot){
 const COMPASS={north:0,northeast:45,east:90,southeast:135,south:180,southwest:225,west:270,northwest:315};
 
 function chainParam(pts,f){            /* frame parameter of each interior kink */
-  return pts.slice(1,-1).map(V=>bisect(x=>f(x,V),0,1));
+  /* A kink lying ON the frame's end line (a boundary that carries straight on
+     past the end of the frontage, then turns) gives no sign change on 0..1,
+     and bisect() then quietly returns the far end - the kink was dropped from
+     every block and a triangle went missing. On 10-12 Morgan St the frontage
+     runs 2.43 m past the access restriction strip: 120 m2 lost from every
+     front/rear cut taken from Marlborough St. Pin such a kink just inside the
+     end it sits on, so chainBetween() still picks it up from that end. */
+  return pts.slice(1,-1).map(V=>{
+    const f0=f(0,V), f1=f(1,V);
+    if((f0<0)===(f1<0)) return Math.abs(f0)<=Math.abs(f1) ? 1e-9 : 1-1e-9;
+    return bisect(x=>f(x,V),0,1);});
 }
 function hitOn(p,q,pts){               /* where line p-q crosses a polyline */
   for(let i=0;i<pts.length-1;i++){
@@ -1424,6 +1434,11 @@ class Parcel{
   frontHit(t){return hitOn(this.front(t),this.rearLine(t),this.frontPts)||this.front(t);}
   rearHit(t){ return hitOn(this.front(t),this.rearLine(t),this.rearPts) ||this.rearLine(t);}
   sideHit(s,k){const pts=k?this.side1Pts:this.side0Pts;
+    /* at the very ends the corner IS the front/rear end point - intersecting
+       two nearly-parallel lines there is ill-conditioned and returned a point
+       3 cm off the corner, which then drew as a phantom 0.03 m boundary */
+    if(Math.abs(s)<1e-9) return this.frontHit(k);
+    if(Math.abs(s-1)<1e-9) return this.rearHit(k);
     return hitOn(this.P(s,0),this.P(s,1),pts)||this.P(s,k);}
 
   pt(s,t){
@@ -1505,6 +1520,99 @@ function frontTarget(run){
      which quietly cost yield on tight sites. */
   const tr=(run.truncation_mode==='cut') ? (run.truncation||0) : 0;
   return Math.max(+ft, RULES.min_lot) + 0.5 + tr*tr/2;}
+
+/* One row of a through-lot layout: the band s0..s1 cut into k lots of equal
+   area by boundaries running street to street within the band. */
+function throughRow(pc,s0,s1,k,lots,new_bdy,fronts){
+  const tot=area(pc.block(s0,s1,0,1)), ts=[0];
+  for(let i=0;i<k-1;i++){const c=ts[ts.length-1];
+    ts.push(bisect(t=>area(pc.block(s0,s1,c,t))-tot/k,c,1));}
+  ts.push(1);
+  for(let j=0;j<k;j++)
+    lots.push({label:'LOT '+(lots.length+1),ring:pc.block(s0,s1,ts[j],ts[j+1]),fronts_road:fronts});
+  for(const t of ts.slice(1,-1)) new_bdy.push([pc.pt(s0,t),pc.pt(s1,t)]);}
+
+/* A THROUGH LOT has two frontages at opposite ends - not a corner. Told apart
+   by direction: the two frontage chords run (anti)parallel and sit well apart.
+   It matters because a lot that fronts both streets of a through lot is not a
+   corner lot (Logan's 15 m corner minimum must not apply), and because the
+   right layouts face lots to both ends. */
+function isThroughLot(frames){
+  if(!frames||frames.length!==2) return false;
+  const [a,b]=frames.map(f=>f.pc);
+  const ua=unit(sub(a.A,a.B)), ub=unit(sub(b.A,b.B));
+  const par=Math.abs(ua[0]*ub[0]+ua[1]*ub[1]);
+  const gap=dist(lerp(a.A,a.B,0.5),lerp(b.A,b.B,0.5));
+  return par>0.8 && gap>Math.max(15,0.5*a.depth);}
+
+/* ACCESS RESTRICTION STRIPS - a sliver of land, usually Council's, between a
+   lot and a road so the lot cannot take access to that road. Common in Logan
+   and Ipswich. The DCDB carries it as an ordinary lot (5RP119577 along 10-12
+   Morgan St's Marlborough St boundary: freehold, 44.7 m2, 0.6 m wide). The
+   frontage test steps over it already; this finds it so the drawing can name
+   it and every option that faces that street can say what it means.
+   Width is 2A/P - exact for a long thin strip. Up to 1.0 m (Mitch, 18/11/2026). */
+const ARS_MAX_W=1.0;
+function findARS(ring,feats,roads){
+  const closed=r=>r.concat([r[0]]);
+  const site=closed(ring);
+  const out=[];
+  for(const f of feats){
+    const a=f.attributes||{}; if(!a.lotplan) continue;
+    const r=f.geometry.rings[0].slice();
+    if(dist(r[0],r[r.length-1])<1e-6) r.pop();
+    if(r.length<3) continue;
+    let P=0; for(let i=0;i<r.length;i++) P+=dist(r[i],r[(i+1)%r.length]);
+    const A=area(r), w=P>0?2*A/P:99;
+    if(!(w<=ARS_MAX_W) || A<1) continue;
+    /* shares a real length of boundary with the site ... */
+    let shared=0;
+    for(let i=0;i<r.length;i++){const p=r[i],q=r[(i+1)%r.length];
+      if(distToChain(p,site)<0.05&&distToChain(q,site)<0.05) shared+=dist(p,q);}
+    if(shared<2) continue;
+    /* ... and touches a road reserve on the other side */
+    const onRoad=r.some(p=>roads.some(rd=>rd.geometry.rings.some(rr=>distToChain(p,rr)<0.1)));
+    if(!onRoad) continue;
+    out.push({lotplan:a.lotplan, lot:a.lot, plan:a.plan, width:w, area:A, ring:r});}
+  return out;}
+
+/* the strip, if any, lying along a frame's frontage */
+function arsAlong(pc,ars){
+  for(const s of (ars||[])){
+    const sr=s.ring.concat([s.ring[0]]);
+    let on=0;
+    for(let i=0;i<pc.frontPts.length-1;i++){
+      const m=lerp(pc.frontPts[i],pc.frontPts[i+1],0.5);
+      if(distToChain(m,sr)<0.05) on+=dist(pc.frontPts[i],pc.frontPts[i+1]);}
+    if(on>=2) return s;}
+  return null;}
+
+/* Lots that depend on a street across an access restriction strip for their
+   vehicle access: their best frontage is to that street, and no other street
+   gives them a crossover. Middle lots on an easement inherit the street the
+   easement runs to. Returns note lines for the sheet. */
+function arsNotes(layout,run){
+  const chains=run.all_front_chains||[], ars=run.all_front_ars||[];
+  if(!ars.some(Boolean)) return [];
+  const streets=run.all_front_streets||[];
+  const hit=new Map();
+  for(const lot of layout.lots){
+    const ring=cleanRing(lot.ring);
+    let fronts=chains.map(ch=>frontageAnyStreet([ch],ring));
+    let k=-1;
+    if(fronts.some(f=>f>=4.5)){
+      const free=fronts.some((f,i)=>f>=4.5&&!ars[i]);
+      if(!free) k=fronts.indexOf(Math.max(...fronts));}
+    else if(layout.handle_t && run.frame_index!=null && ars[run.frame_index]) k=run.frame_index;
+    if(k>=0&&ars[k]){ if(!hit.has(k)) hit.set(k,[]); hit.get(k).push(lot.label); }}
+  const out=[];
+  for(const [k,labs] of hit){
+    const s=ars[k];
+    out.push(labs.join(', ')+' TAKE'+(labs.length>1?'':'S')+' ACCESS FROM '+
+      (streets[k]||'THE STREET')+' ACROSS AN ACCESS RESTRICTION STRIP (LOT '+s.lot+' ON '+
+      s.plan+', '+s.width.toFixed(1)+'m WIDE) - NO VEHICLE ACCESS UNLESS COUNCIL CONSENTS '+
+      'OR THE STRIP IS DEDICATED AS ROAD');}
+  return out;}
 
 function buildLayout(pc,run,site){
   const n=run.n_lots, arr=run.arrangement, tenure=run.handle_tenure;
@@ -1595,6 +1703,57 @@ function buildLayout(pc,run,site){
     const cutPts=on(A);
     return {lots,easements:[],notes,
             new_bdy: cutPts.length>=2 ? [[cutPts[0],cutPts[cutPts.length-1]]] : []};
+  }
+
+  /* THROUGH-LOT SPLIT - the parcel runs street to street, so it is cut across
+     once and each half is divided into lots facing its own street. No handle,
+     no easement: every lot fronts a road. Odd lot counts put the extra lot at
+     THIS frame's street; the other frame produces the mirror image. Lots are
+     equal in area, so the cut sits where the two rows hold their share.
+     (10-12 Morgan St, Bellbird Park: the tool laid a 100 m deep through lot
+     out to one street at a time and never offered lots facing both.) */
+  if(arr==='through_split'){
+    const nf=Math.ceil(n/2), nr=n-nf;
+    const s=bisect(x=>area(pc.block(0,x,0,1))-pc.total*nf/n,0.02,0.98);
+    const lots=[], new_bdy=[[pc.pt(s,0),pc.pt(s,1)]];
+    throughRow(pc,0,s,nf,lots,new_bdy,true);
+    throughRow(pc,s,1,nr,lots,new_bdy,true);
+    return {lots,easements:[],new_bdy,notes,s1:s};
+  }
+
+  /* THROUGH LOT WITH A MIDDLE ROW - two lots facing each street and two middle
+     lots between them, reached by a central access easement over the two lots
+     at THIS frame's street. The client's concept for 10-12 Morgan St. The
+     middle lots have no frontage, so check() treats them as rear lots: rear-lot
+     minimum, access width for two lots, access length. */
+  if(arr==='through_mid'){
+    const hw=run.handle_width||RULES.min_access_2plus||6;
+    const tw0=hw/pc.frontage, per=pc.total/6;
+    const s1=bisect(x=>area(pc.block(0,x,0,1))-2*per,0.02,0.98);
+    const s2=bisect(x=>area(pc.block(x,1,0,1))-2*per,0.02,0.98);
+    if(!(s2>s1+0.05)) throw new Error('the parcel is too shallow for three rows of lots');
+    /* equal halves of the whole row; lo..hi only bounds where the cut may go */
+    const split=(a,b,lo,hi)=>bisect(t=>area(pc.block(a,b,0,t))-area(pc.block(a,b,t,1)),lo,hi);
+    const tm=split(0,s1,tw0,1-tw0), ha=tm-tw0/2, hb=tm+tw0/2;
+    /* the middle boundary must meet the easement or one middle lot has no access */
+    const tmm=Math.min(Math.max(split(s1,s2,0,1),ha+0.1*tw0),hb-0.1*tw0);
+    const tb=split(s2,1,0,1);
+    const lots=[],easements=[],new_bdy=[];
+    const r1=pc.block(0,s1,0,tm), r2=pc.block(0,s1,tm,1);
+    easements.push({label:'EMT A',ring:pc.block(0,s1,ha,tm)},
+                   {label:'EMT B',ring:pc.block(0,s1,tm,hb)});
+    lots.push({label:'LOT 1',ring:r1,fronts_road:true,net:area(r1),env_base:pc.block(0,s1,0,ha)},
+              {label:'LOT 2',ring:r2,fronts_road:true,net:area(r2),env_base:pc.block(0,s1,hb,1)});
+    const m1=pc.block(s1,s2,0,tmm), m2=pc.block(s1,s2,tmm,1);
+    lots.push({label:'LOT 3',ring:m1,fronts_road:false,net:area(m1),body:m1,label_pt:centroid(m1)},
+              {label:'LOT 4',ring:m2,fronts_road:false,net:area(m2),body:m2,label_pt:centroid(m2)});
+    const b1=pc.block(s2,1,0,tb), b2=pc.block(s2,1,tb,1);
+    lots.push({label:'LOT 5',ring:b1,fronts_road:true},{label:'LOT 6',ring:b2,fronts_road:true});
+    new_bdy.push([pc.pt(0,tm),pc.pt(s1,tm)],[pc.pt(s1,0),pc.pt(s1,1)],
+                 [pc.pt(s1,tmm),pc.pt(s2,tmm)],[pc.pt(s2,0),pc.pt(s2,1)],
+                 [pc.pt(s2,tb),pc.pt(1,tb)]);
+    return {lots,easements,new_bdy,notes,handle_width:hw,s1,handle_t:[ha,hb],near:true,
+            handle_len:handleLen(pc,s1)};
   }
 
   if(arr==='corner_split'){
@@ -2076,6 +2235,13 @@ function optionTitle0(pc,run,layout){
     return n+' LOT SPLITTER'+(run.keep_existing_house?' (KEEP EXISTING HOUSE)':'');
   if(arr==='corner_split')
     return '2 LOT CORNER SPLIT - BOTH LOTS FRONT A STREET, NO ACCESS HANDLE';
+  if(arr==='through_split'){
+    const nf=Math.ceil(n/2), nr=n-nf;
+    return n+' LOT THROUGH-LOT SPLIT - '+(nf===nr
+      ? (nf===1?'ONE LOT':nf+' LOTS')+' FACING EACH STREET'
+      : nf+' LOTS FACING THIS STREET, '+nr+' FACING THE OTHER')+', NO ACCESS HANDLE';}
+  if(arr==='through_mid')
+    return '6 LOT THROUGH LOT - 2 LOTS FACING EACH STREET, 2 MIDDLE LOTS ON A CENTRAL EASEMENT';
   if(arr==='parallel_split')
     return '2 LOT SPLIT - NEW BOUNDARY PARALLEL TO THE '+
            (run.parallel_label||'PARENT')+' BOUNDARY';
@@ -2194,7 +2360,7 @@ const CONCEPT_BEL=[10,15];
 
 /* Arrangements that create no access handle or easement at all - every lot
    has its own street frontage, so the access checks do not apply. */
-const NOHANDLE=new Set(['splitter','corner_split','parallel_split','future_road']);
+const NOHANDLE=new Set(['splitter','corner_split','parallel_split','future_road','through_split']);
 
 /* Clip a ring to the half-plane {p : p.n <= c} (or >= c). Sutherland-Hodgman
    against a single half-plane, which is convex, so this is exact for any simple
@@ -2862,7 +3028,9 @@ function frontageRule(lot,pc,run,layout){
     if(onArc>=1.0)
       return {need:RULES.min_frontage_cds, basis:'cul-de-sac head'};}
 
-  if(RULES.min_frontage_corner!=null){
+  /* a through lot's two streets are at opposite ends - a lot fronting both is
+     not on a corner */
+  if(RULES.min_frontage_corner!=null && !run.through_lot){
     let streets=0;
     for(const ch of chains) if(frontageAnyStreet([ch],ring)>=4.5) streets++;
     if(streets>=2) return {need:RULES.min_frontage_corner, basis:'corner lot'};}
@@ -3123,14 +3291,19 @@ function drawing(pc,layout,run,site,comp){
       const seg=[adj.ring[i],adj.ring[(i+1)%adj.ring.length]];
       for(const part of segSubtract(seg,drawn)){pl('V-BNDY_ADJC',part,false); drawn.push(part);}}
     if(adj.label) stack('V-BNDY_ADJC_TEXT_030',centroid(adj.ring),h30,adj.label.split('\n'),rot);}
-  if(site.road_far_edge&&site.road_far_edge.length>1) pl('V-BNDY_ADJC',site.road_far_edge,false);
-  if(site.road_name){
-    const fmid=lerp(pc.B,pc.A,0.5);
-    const rfe=site.road_far_edge&&site.road_far_edge.length>1
-      ? lerp(site.road_far_edge[0],site.road_far_edge[site.road_far_edge.length-1],0.5) : null;
+  /* Every street the site fronts is named at its own frontage. With one
+     frontage this is exactly the old behaviour. */
+  const FRONTS=(site.frontages&&site.frontages.length>1) ? site.frontages
+    : [{street:site.road_name,B:pc.B,A:pc.A,far:site.road_far_edge}];
+  for(const F of FRONTS){
+    if(F.far&&F.far.length>1) pl('V-BNDY_ADJC',F.far,false);
+    if(!F.street) continue;
+    const fmid=lerp(F.B,F.A,0.5);
+    const rfe=F.far&&F.far.length>1 ? lerp(F.far[0],F.far[F.far.length-1],0.5) : null;
+    /* no far edge: push the label outward, away from the site's centre */
+    const away=rfe?rfe:add(fmid,mul(unit(sub(fmid,centroid(parentRing))),10));
     const d=Math.min(rfe?dist(fmid,rfe)/2:8, 8);
-    txtAlong(pc.B,pc.A,site.road_name,'V-ROAD_TEXT',1.8*SC,d,
-             rfe?rfe:pc.P(-1,0.5));}
+    txtAlong(F.B,F.A,F.street,'V-ROAD_TEXT',1.8*SC,d,away);}
 
   /* Contours first, so everything else reads over the top of them, and clipped
      to the subject parcel - a full-extent contour set makes the plan unreadable
@@ -4150,8 +4323,8 @@ const TOOL_NAME='Meliora Subdivision Layout Generator';
 
    Everything before 28/10/2026 shipped as an unstamped 'v1' - roughly thirty
    changes under one label, which is exactly why this exists. */
-const TOOL_VERSION='v1.1';
-const TOOL_BUILD='28 Oct 2026';
+const TOOL_VERSION='v1.2';
+const TOOL_BUILD='18 Nov 2026';
 const r3=v=>Math.round(v*1000)/1000;
 const r2=v=>Math.round(v*100)/100;
 const ring3=r=>r.map(p=>[r3(p[0]),r3(p[1])]);
@@ -5531,6 +5704,24 @@ function siteParts(input){
       if(out.length>1) return {parts:out, kind:'range', original:raw[0]};}}
   return {parts:raw, kind:'single'};}
 
+/* Far side of the road reserve, for the road-name label. Points are kept
+   only if they lie OUTWARD of the frontage - measured on the outward normal
+   - so points sitting on the frontage itself cannot flip the label inward.
+   Per frame: the second street of a corner or through lot has its own. */
+function farEdge(pc,roads){
+  if(!roads||!roads.length) return null;
+  const fmid=lerp(pc.B,pc.A,0.5), fu=unit(sub(pc.A,pc.B));
+  let nOut=[-fu[1],fu[0]];
+  const inward=sub(lerp(pc.C,pc.D,0.5),fmid);
+  if(nOut[0]*inward[0]+nOut[1]*inward[1]>0) nOut=[-nOut[0],-nOut[1]];
+  const cands=[];
+  for(const f of roads) for(const r of f.geometry.rings) for(const q of r){
+    const v=sub(q,fmid), d=v[0]*nOut[0]+v[1]*nOut[1];
+    if(d>4 && d<70) cands.push([q, v[0]*fu[0]+v[1]*fu[1]]);}
+  if(cands.length<2) return null;
+  cands.sort((a,b)=>a[1]-b[1]);
+  return [cands[0][0], cands[cands.length-1][0]];}
+
 async function fetchSite(input){
   const sp=siteParts(input);
   let picks=[];
@@ -5618,15 +5809,30 @@ async function fetchSite(input){
      different subdivisions */
   const frames=buildFrames(ring,roads,lotplan);
   const pc=frames[0].pc;
+  const through=isThroughLot(frames);
   if(frames.length>1)
-    LOG('Corner lot — '+frames.length+' road frontages, so each is laid out in '+
+    LOG((through?'Through lot — streets at both ends, ':'Corner lot — ')+
+        frames.length+' road frontages, so each is laid out in '+
         'its own right: '+frames.map(f=>(f.street||'frontage')+' '+
-        f.pc.frontageChain.toFixed(1)+'m').join(' · '));
+        f.pc.frontageChain.toFixed(1)+'m').join(' · ')+
+        (through?'. Layouts facing lots to both streets are added.':''));
+  /* access restriction strips - counted as frontage, flagged for access */
+  const ars=findARS(ring,feats,roads);
+  frames.forEach(f=>{ f.ars=arsAlong(f.pc,ars); f.far=farEdge(f.pc,roads); });
+  for(const a of ars){
+    const f=frames.find(x=>x.ars===a);
+    LOG('Access restriction strip: Lot '+a.lot+' on '+a.plan+' ('+a.width.toFixed(1)+
+        'm wide) lies between the site and '+((f&&f.street)||'the road')+
+        '. Counted as frontage; lots relying on it for access are flagged — '+
+        'vehicle access needs Council consent or the strip dedicated as road.','warn');}
+  const arsLP=new Set(ars.map(a=>a.lotplan));
 
   const adjoining=feats.filter(f=>f.attributes.lotplan).map(f=>{
     const r=f.geometry.rings[0].slice();
     if(dist(r[0],r[r.length-1])<1e-6) r.pop();
-    return {label:f.attributes.lot+'\n'+f.attributes.plan, ring:r};
+    return {label:(arsLP.has(f.attributes.lotplan)?'ARS ':'')+
+                   f.attributes.lot+'\n'+f.attributes.plan, ring:r,
+            ars:arsLP.has(f.attributes.lotplan)};
   }).filter(a=>a.ring.some(p=>ring.some(q=>dist(p,q)<0.5)))
     /* the DCDB returns easement and covenant parcels too; one whose centre
        falls inside the subject lot is drawn over the top of it, so drop it */
@@ -5635,20 +5841,7 @@ async function fetchSite(input){
   /* Far side of the road reserve, for the road-name label. Points are kept
      only if they lie OUTWARD of the frontage - measured on the outward normal
      - so points sitting on the frontage itself cannot flip the label inward. */
-  let far=null;
-  if(roads.length){
-    const fmid=lerp(pc.B,pc.A,0.5), fu=unit(sub(pc.A,pc.B));
-    let nOut=[-fu[1],fu[0]];
-    const inward=sub(lerp(pc.C,pc.D,0.5),fmid);
-    if(nOut[0]*inward[0]+nOut[1]*inward[1]>0) nOut=[-nOut[0],-nOut[1]];
-    const cands=[];
-    for(const f of roads) for(const r of f.geometry.rings) for(const q of r){
-      const v=sub(q,fmid), d=v[0]*nOut[0]+v[1]*nOut[1];
-      if(d>4 && d<70) cands.push([q, v[0]*fu[0]+v[1]*fu[1]]);}
-    if(cands.length>=2){
-      cands.sort((a,b)=>a[1]-b[1]);
-      far=[cands[0][0], cands[cands.length-1][0]];}
-  }
+  const far=frames[0].far;
   /* the primary frame keeps the street name off the address when the DCDB has
      none; a second frontage without a name is labelled by its bearing */
   /* The address names ONE street, and on a corner there is no way to tell from
@@ -5667,7 +5860,7 @@ async function fetchSite(input){
              compassWord(gridBearing(cn,fm));
   });
 
-  return {pc,frames,lotplan,address,lga,
+  return {pc,frames,lotplan,address,lga,through,ars,
     /* kept so a future internal road can be passed to buildFrames() as an
        extra road parcel alongside the real ones */
     roads,
@@ -5676,6 +5869,11 @@ async function fetchSite(input){
           dcdb_area:subj.lot_area||null,
           road_name:roadName(address),
           adjoining, road_far_edge:far, buildings:[], crossover:null,
+          /* every street the site fronts, so each is named on the drawing in
+             its own place - the second street used to be labelled with the
+             first one's name (MORGAN STREET over Marlborough St options) */
+          frontages:frames.map(f=>({street:f.street,B:f.pc.B,A:f.pc.A,far:f.far,
+            ars:f.ars?{lot:f.ars.lot,plan:f.ars.plan,width:f.ars.width}:null})),
           dem:null, contours:null, cInterval:0},
     dcdb_area:subj.lot_area};
 }
@@ -5938,6 +6136,16 @@ async function run(){
                             FRAMES.length>1).map(c=>({c}));
       if(n===2 && FR===FRAMES[0])
         for(const pe of parallelEdges(pc)) jobs.push({c:['parallel_split',near,'rear_lot'],pe});
+      /* Through lot: lots face BOTH streets. The through-lot split replaces the
+         corner split (same idea, equal lots instead of a minimum front lot). An
+         even count gives the same layout from either end, so it is generated
+         once; an odd count puts the extra lot at this frame's street, so both
+         ends get theirs. The six-lot middle-row layout is generated from each
+         end, because which street the easement runs to is the real choice. */
+      if(S.through){
+        jobs=jobs.filter(j=>j.c[0]!=='corner_split');
+        if(n%2===1 || FR===FRAMES[0]) jobs.unshift({c:['through_split',near,'rear_lot']});
+        if(n===6) jobs.push({c:['through_mid','central','easement']});}
       /* Prompt 3d. Only arrangements that actually HAVE a rear access strip are
          filtered - on a splitter, a corner split or a parallel split the tenure
          slot is carried but means nothing, so those must pass through. */
@@ -5955,6 +6163,8 @@ async function run(){
           parallel_edge:job.pe&&job.pe.seg, parallel_label:job.pe&&job.pe.label,
           handle_position:handle,handle_tenure:tenure,keep_existing_house:!!keep,
           frontage_street:FR.street, multi_frontage:FRAMES.length>1,
+          through_lot:!!S.through, frame_index:FRAMES.indexOf(FR),
+          all_front_ars:FRAMES.map(f=>f.ars||null),
           all_front_chains:FRAMES.map(f=>f.pc.frontPts),
           /* parallel to all_front_chains - so a lot's crossover can name the
              street it is in, not just the street of the selected frame */
@@ -5964,7 +6174,7 @@ async function run(){
            from the road. A 3.5m handle instead of 6m gives a small rear lot
            back 2.5m x its length, which is often what makes it compliant. */
         if(autoHandle && arr!=='splitter'){
-          const nRear = arr==='rear_lot' ? 1 : n-1;
+          const nRear = arr==='rear_lot' ? 1 : arr==='through_mid' ? 2 : n-1;
           const row=accessRow(Math.max(1,nRear), pc.depth);
           if(row){ run.handle_width=row.width;
             if(row.driveway) run.driveway_width =
@@ -5987,6 +6197,7 @@ async function run(){
               layout=buildLayout(pc,run,S.site);}}
           applyTruncation(pc,layout,run.truncation,run.truncation_mode);
           deriveNetAreas(layout);      /* must run AFTER the truncation */
+          for(const nt of arsNotes(layout,run)) layout.notes.push(nt);
           layout.title=optionTitle(pc,run,layout);
           if(run.driveway_width) layout.driveway=buildDriveway(pc,layout,run.driveway_width,
                                                   run.kerb_offset,run.wing);

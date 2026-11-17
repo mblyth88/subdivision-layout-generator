@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.2 – 18 Nov 2026
+
+- **Through lots and access restriction strips.** A site with streets at both ends is now called a through lot, not a corner lot, and gets layouts with lots facing both streets, including the 6-lot layout with 2 lots facing each street and 2 middle lots on a central easement. A strip 1.0 m wide or less between the site and a road is labelled ARS on the drawing and still counts as frontage, and every lot relying on it for access gets a note: no vehicle access unless Council consents or the strip is dedicated as road. Each street is now named at its own frontage, so Marlborough St options no longer read "MORGAN STREET". Also fixed a frame bug that dropped a triangle of land when a frontage carried straight on past the road before turning (120 m² on 10-12 Morgan St, Bellbird Park).
+
 ## v1.1 – 28 Oct 2026
 
 First build with a version stamp. Everything before this shipped as an unstamped "v1" — about thirty changes under one label, which is why the stamp now exists. It shows in the page header (`v1.1 · 28 Oct 2026`) and in every option JSON under `generator`.
